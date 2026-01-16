@@ -1,0 +1,19 @@
+wheel<=0.29.0
+extras
+setuptools-rust<=1.1.2
+boto3>=1.17.58,<=1.20.46
+botocore>=1.18.58,<=1.23.46
+#bunch>=1.0.1
+cachetools>=3.1.1,<=4.2.4
+coverage>=4.5.4,<=6.2
+fixtures==3.0.0
+fusepy==3.0.1
+mock>=3.0.5,<=4.0.3
+moto>=1.3.8,<=3.0.1
+msgpack>=0.6.0,<=1.0.3
+oslo.concurrency>=3.30,<=4.5.0
+oslo.config>=6.9.0,<=8.7.1
+oslo.privsep>=1.33.3,<=2.6.2
+PyYAML>=5.1,<=6.0
+simplejson>=3.17.0,<=3.17.6
+dnspython<=1.16.0  # dnspython>1.16.0 has issues which results JIRA#TVAULT-5387

@@ -1,0 +1,8 @@
+SQLAlchemy<2.0.0,>=1.4.0
+pika>=1.3.0
+python-keystoneclient>=5.0.0
+keystoneauth1>=5.0.0
+python-barbicanclient>=5.5.0
+psutil>=5.9.0
+mysql-connector-python>=8.0.0
+click>=8.0.0
