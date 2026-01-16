@@ -1,9 +1,5 @@
 """
-Trilio DMS Client - Database and RabbitMQ Client
-Responsibilities:
-- Manage backup_target_mount_ledger table
-- Send mount/unmount requests to DMS Server via RabbitMQ
-- Track mount/unmount operations in database
+Trilio DMS Client - Database and RabbitMQ Client with Global Locking
 """
 
 import json
@@ -19,13 +15,14 @@ from sqlalchemy.exc import SQLAlchemyError
 from trilio_dms.models import BackupTargetMountLedger, Base
 from trilio_dms.config import DMSConfig
 from trilio_dms.exceptions import (
-    DMSClientException, RequestValidationException, 
+    DMSClientException, RequestValidationException,
     RequestTimeoutException, DatabaseException, RabbitMQException
 )
 from trilio_dms.utils import (
-    validate_request_structure, create_response, 
+    validate_request_structure, create_response,
     safe_json_dumps, safe_json_loads
 )
+from trilio_dms.lock_manager import get_lock_manager, DMSLockManager
 
 logging.basicConfig(
     level=DMSConfig.LOG_LEVEL,
@@ -34,24 +31,47 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
+# Exception classes for DMS Client
+class DMSClientError(Exception):
+    """Base exception for DMS Client errors."""
+    pass
+
+
+class DMSMountError(DMSClientError):
+    """Exception raised when mount operation fails."""
+    pass
+
+
+class DMSUnmountError(DMSClientError):
+    """Exception raised when unmount operation fails."""
+    pass
+
+
+class DMSLockTimeoutError(DMSClientError):
+    """Exception raised when lock acquisition times out."""
+    pass
+
+
 class DMSClient:
-    """DMS Client for managing mount operations and database"""
-    
-    def __init__(self, db_url: Optional[str] = None, 
-                 rabbitmq_url: Optional[str] = None, 
-                 timeout: Optional[int] = None):
-        """
-        Initialize DMS Client
-        
-        Args:
-            db_url: Database URL (uses config default if not provided)
-            rabbitmq_url: RabbitMQ URL (uses config default if not provided)
-            timeout: Request timeout in seconds (uses config default if not provided)
-        """
+    """DMS Client for managing mount operations with global locking"""
+
+    def __init__(self, db_url: Optional[str] = None,
+                 rabbitmq_url: Optional[str] = None,
+                 timeout: Optional[int] = None,
+                 lock_timeout: Optional[int] = None,
+                 lock_dir: Optional[str] = None):
+        """Initialize DMS Client"""
         self.db_url = db_url or DMSConfig.DB_URL
         self.rabbitmq_url = rabbitmq_url or DMSConfig.RABBITMQ_URL
         self.timeout = timeout or DMSConfig.REQUEST_TIMEOUT
-        
+
+        # Setup lock manager
+        self.lock_manager = get_lock_manager(
+            lock_dir=lock_dir,
+            timeout=lock_timeout or 300
+        )
+        logger.info("Lock manager initialized")
+
         # Setup database
         try:
             self.engine = create_engine(self.db_url, pool_pre_ping=True)
@@ -60,15 +80,15 @@ class DMSClient:
             logger.info("Database connection established")
         except Exception as e:
             raise DatabaseException(f"Failed to initialize database: {e}")
-        
-        # Setup RabbitMQ connection
+
+        # Setup RabbitMQ
         self.connection = None
         self.channel = None
         self.callback_queue = None
         self.response = None
         self.corr_id = None
         self._setup_rabbitmq()
-    
+
     def _setup_rabbitmq(self):
         """Setup RabbitMQ connection"""
         try:
@@ -76,21 +96,17 @@ class DMSClient:
                 pika.URLParameters(self.rabbitmq_url)
             )
             self.channel = self.connection.channel()
-            
-            # Declare callback queue for responses
             result = self.channel.queue_declare(queue='', exclusive=True)
             self.callback_queue = result.method.queue
-            
             self.channel.basic_consume(
                 queue=self.callback_queue,
                 on_message_callback=self._on_response,
                 auto_ack=True
             )
-            
             logger.info("RabbitMQ connection established")
         except Exception as e:
             raise RabbitMQException(f"Failed to setup RabbitMQ: {e}")
-    
+
     def _on_response(self, ch, method, props, body):
         """Handle response from DMS Server"""
         if self.corr_id == props.correlation_id:
@@ -98,349 +114,350 @@ class DMSClient:
                 self.response = json.loads(body)
             except json.JSONDecodeError:
                 self.response = create_response('error', 'Invalid response format')
-    
+
     def mount(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Send mount request to DMS Server and track in database
-        
-        Args:
-            request: Mount request containing all required fields
-        
-        Returns:
-            Response dict with status, error_msg, success_msg
-        """
+        """Mount with global locking"""
         request['action'] = 'mount'
-        return self._execute_request(request)
-    
+        try:
+            with self.lock_manager.acquire_lock("mount_unmount"):
+                return self._execute_mount_request(request)
+        except TimeoutError as e:
+            logger.error(f"Lock timeout for mount: {e}")
+            return create_response('error', f'Could not acquire lock: {e}')
+
     def unmount(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """
-        Send unmount request to DMS Server and track in database
-        
-        Args:
-            request: Unmount request containing all required fields
-        
-        Returns:
-            Response dict with status, error_msg, success_msg
-        """
+        """Unmount with smart logic and global locking"""
         request['action'] = 'unmount'
-        return self._execute_request(request)
-    
-    def _execute_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute mount/unmount request and track in database"""
+        try:
+            with self.lock_manager.acquire_lock("mount_unmount"):
+                return self._execute_unmount_request(request)
+        except TimeoutError as e:
+            logger.error(f"Lock timeout for unmount: {e}")
+            return create_response('error', f'Could not acquire lock: {e}')
+
+    def _execute_mount_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute mount with lock held"""
         session = self.SessionLocal()
-        ledger = None
-        action = request.get('action', 'unknown')
         
         try:
-            # Validate request
             validate_request_structure(request)
-            
+
             job_id = int(request['job']['jobid'])
             backup_target_id = request['backup_target']['id']
             host = request['host']
-            
-            # Check if ledger entry exists
-            ledger = session.query(BackupTargetMountLedger).filter(
+
+            logger.info(f"Mount - jobid={job_id}, target={backup_target_id}, host={host}")
+
+            # Check if already mounted for this job
+            existing = session.query(BackupTargetMountLedger).filter(
                 and_(
                     BackupTargetMountLedger.jobid == job_id,
                     BackupTargetMountLedger.backup_target_id == backup_target_id,
-                    BackupTargetMountLedger.deleted == False
+                    BackupTargetMountLedger.host == host
                 )
             ).first()
+
+            if existing and existing.mounted:
+                logger.info(f"Already mounted for jobid={job_id}, reusing")
+                # Get mount path from request body
+                mount_path = request['backup_target'].get('filesystem_export_mount_path')
+                return create_response(
+                    'success',
+                    success_msg='Target already mounted (reused existing)',
+                    mount_path=mount_path,
+                    reused_existing=True
+                )
+
+            # Check if mounted by other jobs
+            other_mounts = session.query(BackupTargetMountLedger).filter(
+                and_(
+                    BackupTargetMountLedger.backup_target_id == backup_target_id,
+                    BackupTargetMountLedger.host == host,
+                    BackupTargetMountLedger.mounted == True
+                )
+            ).first()
+
+            physically_mounted = False
             
-            if action == 'mount':
-                if not ledger:
-                    # Create new ledger entry
-                    ledger = BackupTargetMountLedger(
-                        backup_target_id=backup_target_id,
-                        jobid=job_id,
-                        host=host,
-                        mounted=False,
-                        deleted=False,
-                        version='1.0',
-                        created_at=datetime.utcnow()
-                    )
-                    session.add(ledger)
-                    session.commit()
-                    logger.info(f"Created ledger entry {ledger.id} for mount request")
-                else:
-                    logger.info(f"Using existing ledger entry {ledger.id}")
-            
-            elif action == 'unmount':
-                if not ledger:
-                    logger.warning(f"No ledger entry found for unmount: job={job_id}, target={backup_target_id}")
-                    # Still send unmount request to server
-            
-            # Send request to DMS Server
-            response = self._send_request(request)
-            
-            # Update ledger based on response
-            if ledger:
-                if action == 'mount' and response['status'] == 'success':
-                    ledger.mounted = True
-                    ledger.updated_at = datetime.utcnow()
-                    session.commit()
-                    logger.info(f"Updated ledger {ledger.id}: mounted=True")
+            if not other_mounts:
+                # Need to physically mount
+                logger.info("No existing mount. Sending mount request to DMS server")
+                response = self._send_request(request)
                 
-                elif action == 'unmount' and response['status'] == 'success':
-                    ledger.mounted = False
-                    ledger.updated_at = datetime.utcnow()
-                    session.commit()
-                    logger.info(f"Updated ledger {ledger.id}: mounted=False")
+                if response['status'] != 'success':
+                    logger.error(f"Mount failed: {response.get('error_msg')}")
+                    return response
+                
+                physically_mounted = True
+                logger.info(f"Successfully mounted {backup_target_id} on {host}")
+            else:
+                logger.info("Reusing existing mount from another job")
+
+            # Create or update ledger
+            if existing:
+                existing.mounted = True
+                logger.debug(f"Updated ledger for jobid={job_id}")
+            else:
+                ledger = BackupTargetMountLedger(
+                    jobid=job_id,
+                    backup_target_id=backup_target_id,
+                    host=host,
+                    mounted=True
+                )
+                session.add(ledger)
+                logger.debug(f"Created ledger for jobid={job_id}")
+
+            session.commit()
+            logger.info(f"Ledger updated: jobid={job_id}, mounted=True")
+
+            # Get mount path from request body
+            mount_path = request['backup_target'].get('filesystem_export_mount_path')
             
-            return response
-            
+            return create_response(
+                'success',
+                success_msg='Mount successful',
+                mount_path=mount_path,
+                reused_existing=not physically_mounted,
+                physically_mounted=physically_mounted
+            )
+
         except RequestValidationException as e:
-            logger.error(f"Request validation failed: {e}")
+            logger.error(f"Validation failed: {e}")
             return create_response('error', str(e))
-            
         except Exception as e:
-            logger.error(f"Request execution failed: {e}", exc_info=True)
+            logger.error(f"Mount failed: {e}", exc_info=True)
+            session.rollback()
             return create_response('error', str(e))
-        
         finally:
             session.close()
-    
-    def _send_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        """Send request to DMS Server via RabbitMQ and wait for response"""
-        self.response = None
-        self.corr_id = str(uuid.uuid4())
-        
-        # Determine target queue based on host
-        queue_name = f"dms.{request['host']}"
+
+    def _execute_unmount_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute unmount with smart logic"""
+        session = self.SessionLocal()
         
         try:
-            # Declare queue if it doesn't exist
+            validate_request_structure(request)
+
+            job_id = int(request['job']['jobid'])
+            backup_target_id = request['backup_target']['id']
+            host = request['host']
+
+            logger.info(f"Unmount - jobid={job_id}, target={backup_target_id}, host={host}")
+
+            # Query active mounts
+            active_mounts = session.query(BackupTargetMountLedger).filter(
+                and_(
+                    BackupTargetMountLedger.backup_target_id == backup_target_id,
+                    BackupTargetMountLedger.host == host,
+                    BackupTargetMountLedger.mounted == True
+                )
+            ).all()
+
+            mount_count = len(active_mounts)
+            logger.info(f"Found {mount_count} active mount(s)")
+
+            # Find current job's entry
+            current_job_entry = None
+            for mount in active_mounts:
+                if mount.jobid == job_id:
+                    current_job_entry = mount
+                    break
+
+            if not current_job_entry:
+                logger.warning(f"No active mount found for jobid={job_id}")
+                return create_response(
+                    'error',
+                    error_msg='No active mount found for this job',
+                    unmounted=False,
+                    active_mounts_remaining=mount_count
+                )
+
+            physically_unmounted = False
+
+            # Check if should physically unmount
+            if mount_count == 1:
+                # Last mount - safe to unmount
+                logger.info("Single active mount. Sending unmount to DMS server")
+                
+                response = self._send_request(request)
+                
+                if response['status'] != 'success':
+                    logger.error(f"Unmount failed: {response.get('error_msg')}")
+                    return response
+                
+                physically_unmounted = True
+                logger.info(f"Successfully unmounted {backup_target_id} on {host}")
+            else:
+                # Multiple mounts - skip physical unmount
+                logger.info(f"Multiple mounts ({mount_count}). Skipping physical unmount")
+
+            # Update ledger
+            current_job_entry.mounted = False
+            session.commit()
+            logger.info(f"Ledger updated: jobid={job_id}, mounted=False")
+
+            return create_response(
+                'success',
+                success_msg=(
+                    'Successfully unmounted' if physically_unmounted
+                    else 'Ledger updated, physical mount retained for other jobs'
+                ),
+                unmounted=physically_unmounted,
+                active_mounts_remaining=mount_count - 1
+            )
+
+        except RequestValidationException as e:
+            logger.error(f"Validation failed: {e}")
+            return create_response('error', str(e))
+        except Exception as e:
+            logger.error(f"Unmount failed: {e}", exc_info=True)
+            session.rollback()
+            return create_response('error', str(e))
+        finally:
+            session.close()
+
+    def _send_request(self, request: Dict[str, Any]) -> Dict[str, Any]:
+        """Send request to DMS Server via RabbitMQ"""
+        self.response = None
+        self.corr_id = str(uuid.uuid4())
+        queue_name = f"dms.{request['host']}"
+
+        try:
             self.channel.queue_declare(queue=queue_name, durable=True)
             
-            # Send request
             self.channel.basic_publish(
                 exchange='',
                 routing_key=queue_name,
                 properties=pika.BasicProperties(
                     reply_to=self.callback_queue,
                     correlation_id=self.corr_id,
-                    delivery_mode=2,  # persistent
+                    delivery_mode=2,
                     content_type='application/json'
                 ),
                 body=json.dumps(request)
             )
-            
-            logger.info(f"Sent request to queue: {queue_name}, correlation_id: {self.corr_id}")
-            
+
+            logger.info(f"Sent {request.get('action')} to {queue_name}, corr_id={self.corr_id}")
+
             # Wait for response
             timeout_counter = 0
             while self.response is None:
                 self.connection.process_data_events(time_limit=1)
                 timeout_counter += 1
-                
                 if timeout_counter > self.timeout:
-                    raise RequestTimeoutException(
-                        f"Request timeout after {self.timeout} seconds"
-                    )
-            
+                    raise RequestTimeoutException(f"Timeout after {self.timeout}s")
+
+            logger.info(f"Received response: {self.response.get('status')}")
             return self.response
-            
+
         except RequestTimeoutException:
             raise
         except Exception as e:
             raise RabbitMQException(f"Failed to send request: {e}")
-    
+
     def get_mount_status(self, job_id: int, backup_target_id: str) -> Optional[BackupTargetMountLedger]:
-        """
-        Get mount status from ledger
-        
-        Args:
-            job_id: Job ID
-            backup_target_id: Backup target ID
-            
-        Returns:
-            Ledger entry or None
-        """
+        """Get mount status"""
         session = self.SessionLocal()
         try:
-            ledger = session.query(BackupTargetMountLedger).filter(
+            return session.query(BackupTargetMountLedger).filter(
                 and_(
                     BackupTargetMountLedger.jobid == job_id,
-                    BackupTargetMountLedger.backup_target_id == backup_target_id,
-                    BackupTargetMountLedger.deleted == False
+                    BackupTargetMountLedger.backup_target_id == backup_target_id
                 )
             ).first()
-            
-            return ledger
         except Exception as e:
-            logger.error(f"Failed to get mount status: {e}")
+            logger.error(f"Failed to get status: {e}")
             return None
         finally:
             session.close()
-    
-    def get_active_mounts(self, host: Optional[str] = None, 
+
+    def get_active_mounts(self, host: Optional[str] = None,
                          backup_target_id: Optional[str] = None) -> List[BackupTargetMountLedger]:
-        """
-        Get all active mounts
-        
-        Args:
-            host: Filter by host (optional)
-            backup_target_id: Filter by backup target ID (optional)
-            
-        Returns:
-            List of active mount ledger entries
-        """
+        """Get all active mounts"""
         session = self.SessionLocal()
         try:
             query = session.query(BackupTargetMountLedger).filter(
-                and_(
-                    BackupTargetMountLedger.mounted == True,
-                    BackupTargetMountLedger.deleted == False
-                )
+                BackupTargetMountLedger.mounted == True
             )
-            
             if host:
                 query = query.filter(BackupTargetMountLedger.host == host)
-            
             if backup_target_id:
                 query = query.filter(BackupTargetMountLedger.backup_target_id == backup_target_id)
-            
             return query.all()
-            
         except Exception as e:
             logger.error(f"Failed to get active mounts: {e}")
             return []
         finally:
             session.close()
-    
-    def get_ledger_history(self, backup_target_id: str, limit: int = 100) -> List[BackupTargetMountLedger]:
-        """
-        Get ledger history for a backup target
-        
-        Args:
-            backup_target_id: Backup target ID
-            limit: Maximum number of entries to return
-            
-        Returns:
-            List of ledger entries
-        """
-        session = self.SessionLocal()
-        try:
-            entries = session.query(BackupTargetMountLedger).filter(
-                and_(
-                    BackupTargetMountLedger.backup_target_id == backup_target_id,
-                    BackupTargetMountLedger.deleted == False
-                )
-            ).order_by(
-                BackupTargetMountLedger.created_at.desc()
-            ).limit(limit).all()
-            
-            return entries
-        except Exception as e:
-            logger.error(f"Failed to get ledger history: {e}")
-            return []
-        finally:
-            session.close()
-    
-    def soft_delete_entry(self, job_id: int, backup_target_id: str) -> bool:
-        """
-        Soft delete a ledger entry
-        
-        Args:
-            job_id: Job ID
-            backup_target_id: Backup target ID
-            
-        Returns:
-            True if successful
-        """
-        session = self.SessionLocal()
-        try:
-            ledger = session.query(BackupTargetMountLedger).filter(
-                and_(
-                    BackupTargetMountLedger.jobid == job_id,
-                    BackupTargetMountLedger.backup_target_id == backup_target_id,
-                    BackupTargetMountLedger.deleted == False
-                )
-            ).first()
-            
-            if ledger:
-                ledger.deleted = True
-                ledger.deleted_at = datetime.utcnow()
-                ledger.updated_at = datetime.utcnow()
-                session.commit()
-                logger.info(f"Soft deleted ledger entry {ledger.id}")
-                return True
-            
-            return False
-            
-        except Exception as e:
-            logger.error(f"Failed to soft delete entry: {e}")
-            session.rollback()
-            return False
-        finally:
-            session.close()
-    
+
     def close(self):
         """Close connections"""
         if self.connection and not self.connection.is_closed:
             try:
                 self.connection.close()
-                logger.info("RabbitMQ connection closed")
+                logger.info("RabbitMQ closed")
             except Exception as e:
-                logger.warning(f"Error closing RabbitMQ connection: {e}")
-        
+                logger.warning(f"Error closing RabbitMQ: {e}")
         if self.engine:
             try:
                 self.engine.dispose()
-                logger.info("Database connection closed")
+                logger.info("Database closed")
             except Exception as e:
-                logger.warning(f"Error closing database connection: {e}")
+                logger.warning(f"Error closing database: {e}")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
 
 class MountContext:
     """Context manager for automatic mount/unmount"""
-    
+
     def __init__(self, client: DMSClient, request: Dict[str, Any]):
-        """
-        Initialize mount context
-        
-        Args:
-            client: DMSClient instance
-            request: Mount request dictionary
-        """
         self.client = client
         self.request = request
         self.mount_response = None
         self.mount_path = None
-    
+
     def __enter__(self):
-        """Mount on enter"""
         self.request['action'] = 'mount'
         self.mount_response = self.client.mount(self.request)
-        
+
         if self.mount_response['status'] != 'success':
             raise DMSClientException(
                 f"Mount failed: {self.mount_response.get('error_msg')}"
             )
+
+        # Get mount path from response (which comes from request body)
+        self.mount_path = self.mount_response.get('mount_path')
         
-        # Get mount path from backup_target
-        self.mount_path = self.request['backup_target'].get(
-            'filesystem_export_mount_path',
-            f"{DMSConfig.MOUNT_BASE_PATH}/{self.request['backup_target']['id']}"
-        )
+        if not self.mount_path:
+            # Fallback to backup_target fields
+            self.mount_path = self.request['backup_target'].get('filesystem_export_mount_path')
+        
         logger.info(f"Mount successful: {self.mount_path}")
-        
         return self
-    
+
     def __exit__(self, exc_type, exc_val, exc_tb):
-        """Unmount on exit"""
         try:
             self.request['action'] = 'unmount'
-            unmount_response = self.client.unmount(self.request)
+            response = self.client.unmount(self.request)
             
-            if unmount_response['status'] == 'success':
-                logger.info("Unmount successful")
+            if response['status'] == 'success':
+                if response.get('unmounted'):
+                    logger.info("Unmount successful (physically unmounted)")
+                else:
+                    logger.info(
+                        f"Unmount successful (ledger updated, "
+                        f"{response.get('active_mounts_remaining', 0)} jobs still using)"
+                    )
             else:
-                logger.warning(f"Unmount failed: {unmount_response.get('error_msg')}")
+                logger.warning(f"Unmount failed: {response.get('error_msg')}")
         except Exception as e:
             logger.error(f"Error during unmount: {e}")
-    
+
     def get_mount_path(self) -> str:
-        """Get mount path"""
         return self.mount_path
