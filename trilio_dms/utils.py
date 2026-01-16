@@ -31,7 +31,7 @@ def validate_request_structure(request: Dict[str, Any]) -> bool:
             raise ValueError(f"Missing required field: {field}")
     
     # Validate job structure
-    job_fields = ['jobid', 'progress', 'status', 'action']
+    job_fields = ['jobid', 'status', 'action']
     for field in job_fields:
         if field not in request['job']:
             raise ValueError(f"Missing required job field: {field}")

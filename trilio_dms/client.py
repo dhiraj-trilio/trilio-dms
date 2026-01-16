@@ -61,6 +61,12 @@ class DMSClient:
                  lock_timeout: Optional[int] = None,
                  lock_dir: Optional[str] = None):
         """Initialize DMS Client"""
+        
+        # Ensure client config is loaded
+        from trilio_dms.config import DMSConfig
+        if not DMSConfig._loaded:
+            DMSConfig.load_config(config_type='client')
+        
         self.db_url = db_url or DMSConfig.DB_URL
         self.rabbitmq_url = rabbitmq_url or DMSConfig.RABBITMQ_URL
         self.timeout = timeout or DMSConfig.REQUEST_TIMEOUT
@@ -161,12 +167,15 @@ class DMSClient:
                 logger.info(f"Already mounted for jobid={job_id}, reusing")
                 # Get mount path from request body
                 mount_path = request['backup_target'].get('filesystem_export_mount_path')
-                return create_response(
+                
+                response = create_response(
                     'success',
-                    success_msg='Target already mounted (reused existing)',
-                    mount_path=mount_path,
-                    reused_existing=True
+                    success_msg='Target already mounted (reused existing)'
                 )
+                response['mount_path'] = mount_path
+                response['reused_existing'] = True
+                
+                return response
 
             # Check if mounted by other jobs
             other_mounts = session.query(BackupTargetMountLedger).filter(
@@ -207,19 +216,44 @@ class DMSClient:
                 session.add(ledger)
                 logger.debug(f"Created ledger for jobid={job_id}")
 
-            session.commit()
-            logger.info(f"Ledger updated: jobid={job_id}, mounted=True")
+            try:
+                session.commit()
+                logger.info(f"Ledger updated: jobid={job_id}, mounted=True")
+            except Exception as e:
+                session.rollback()
+                error_msg = str(e)
+                
+                # Handle foreign key constraint errors
+                if 'foreign key constraint' in error_msg.lower():
+                    if 'jobid' in error_msg.lower():
+                        logger.error(f"Job {job_id} does not exist in job table")
+                        return create_response(
+                            'error',
+                            f'Job {job_id} not found. Please ensure job exists before mounting.'
+                        )
+                    elif 'backup_target' in error_msg.lower():
+                        logger.error(f"Backup target {backup_target_id} does not exist")
+                        return create_response(
+                            'error',
+                            f'Backup target {backup_target_id} not found.'
+                        )
+                
+                # Re-raise for other errors
+                raise
 
             # Get mount path from request body
             mount_path = request['backup_target'].get('filesystem_export_mount_path')
             
-            return create_response(
+            response = create_response(
                 'success',
-                success_msg='Mount successful',
-                mount_path=mount_path,
-                reused_existing=not physically_mounted,
-                physically_mounted=physically_mounted
+                success_msg='Mount successful'
             )
+            # Add additional fields to response
+            response['mount_path'] = mount_path
+            response['reused_existing'] = not physically_mounted
+            response['physically_mounted'] = physically_mounted
+            
+            return response
 
         except RequestValidationException as e:
             logger.error(f"Validation failed: {e}")
