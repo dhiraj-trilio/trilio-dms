@@ -1,0 +1,21 @@
+include README.md
+include LICENSE
+include requirements.txt
+include schema.sql
+
+recursive-include trilio_dms *.py
+recursive-include tests *.py
+recursive-include examples *.py
+
+exclude .gitignore
+exclude .dockerignore
+exclude docker-compose.yml
+exclude Dockerfile*
+exclude deploy.sh
+exclude .env*
+
+global-exclude __pycache__
+global-exclude *.py[co]
+global-exclude .DS_Store
+global-exclude *.so
+global-exclude *.dylib
