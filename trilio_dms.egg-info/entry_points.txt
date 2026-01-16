@@ -1,3 +1,0 @@
-[console_scripts]
-trilio-dms = trilio_dms.server.dms_server:main
-trilio-dms-cli = trilio_dms.cli.main:main
