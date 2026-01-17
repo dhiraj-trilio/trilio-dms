@@ -94,8 +94,6 @@ KEYSTONE_TOKEN=your-token
 # Node (Server)
 DMS_NODE_ID=compute-01
 
-# Mount Path (Server)
-DMS_MOUNT_BASE=/var/lib/trilio/mounts
 ```
 
 ### Database Setup
