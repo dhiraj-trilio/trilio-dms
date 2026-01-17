@@ -30,6 +30,9 @@ class DMSConfig:
     DEFAULT_LOG_LEVEL = 'INFO'
     DEFAULT_LOG_FORMAT = '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
     DEFAULT_REQUEST_TIMEOUT = 60
+    DEFAULT_S3VAULTFUSE_BIN = '/usr/bin/s3vaultfuse.py'
+    DEFAULT_ROOTWRAP_BIN = '/usr/bin/workloadmgr-rootwrap'
+    DEFAULT_ROOTWRAP_CONF = '/etc/triliovault-wlm/rootwrap.conf'
     
     # Class attributes (loaded values)
     RABBITMQ_URL = None
@@ -40,9 +43,13 @@ class DMSConfig:
     LOG_LEVEL = None
     LOG_FORMAT = None
     REQUEST_TIMEOUT = None
+    S3VAULTFUSE_BIN = None
+    ROOTWRAP_BIN = None
+    ROOTWRAP_CONF = None
     
     _loaded = False
     _config_data = {}
+    _config_type = None  # Track which config type was loaded
     
     @classmethod
     def load_config(cls, config_file: Optional[str] = None, config_type: str = 'server'):
@@ -53,9 +60,14 @@ class DMSConfig:
             config_file: Path to config file (optional)
             config_type: 'server' or 'client' (determines default config file)
         """
-        if cls._loaded:
-            logger.debug(f"Configuration already loaded, skipping reload")
+        if cls._loaded and cls._config_type == config_type:
+            logger.debug(f"Configuration already loaded for {config_type}, skipping reload")
             return
+        
+        # If different config type requested, reload
+        if cls._loaded and cls._config_type != config_type:
+            logger.info(f"Reloading config: {cls._config_type} -> {config_type}")
+            cls._loaded = False
         
         # Determine config file path
         if config_file is None:
@@ -66,6 +78,7 @@ class DMSConfig:
         # Load from INI file
         config_data = cls._load_ini_file(config_file)
         cls._config_data = config_data
+        cls._config_type = config_type
         
         # Load configuration with priority: env var > config file > default
         cls.RABBITMQ_URL = os.environ.get(
@@ -107,6 +120,21 @@ class DMSConfig:
             'DMS_REQUEST_TIMEOUT',
             config_data.get('request_timeout', cls.DEFAULT_REQUEST_TIMEOUT)
         ))
+        
+        cls.S3VAULTFUSE_BIN = os.environ.get(
+            'DMS_S3VAULTFUSE_BIN',
+            config_data.get('s3vaultfuse_bin', cls.DEFAULT_S3VAULTFUSE_BIN)
+        )
+        
+        cls.ROOTWRAP_BIN = os.environ.get(
+            'DMS_ROOTWRAP_BIN',
+            config_data.get('rootwrap_bin', cls.DEFAULT_ROOTWRAP_BIN)
+        )
+        
+        cls.ROOTWRAP_CONF = os.environ.get(
+            'DMS_ROOTWRAP_CONF',
+            config_data.get('rootwrap_conf', cls.DEFAULT_ROOTWRAP_CONF)
+        )
         
         cls._loaded = True
         
@@ -171,7 +199,10 @@ class DMSConfig:
             'node_id': cls.NODE_ID,
             'auth_url': cls.AUTH_URL,
             'mount_base_path': cls.MOUNT_BASE_PATH,
-            'log_level': cls.LOG_LEVEL
+            'log_level': cls.LOG_LEVEL,
+            's3vaultfuse_bin': cls.S3VAULTFUSE_BIN,
+            'rootwrap_bin': cls.ROOTWRAP_BIN,
+            'rootwrap_conf': cls.ROOTWRAP_CONF
         }
     
     @classmethod
@@ -273,26 +304,26 @@ class DMSConfig:
 # Auto-load configuration on module import
 # This ensures config is loaded before any other module uses it
 try:
-    # Try to determine if we're running server or client
+    # Check which config file exists
     import sys
     
-    # Check for server config file
     server_exists = os.path.exists(DMSConfig.SERVER_CONFIG_FILE)
     client_exists = os.path.exists(DMSConfig.CLIENT_CONFIG_FILE)
     
-    if 'server' in sys.argv[0] or 'dms-server' in sys.argv[0]:
-        DMSConfig.load_config(config_type='server')
-    elif 'client' in sys.argv[0] or 'dms-client' in sys.argv[0]:
-        DMSConfig.load_config(config_type='client')
-    elif client_exists:
-        # If client config exists, assume client mode
-        DMSConfig.load_config(config_type='client')
-    elif server_exists:
-        # If only server config exists, use that
-        DMSConfig.load_config(config_type='server')
+    # Determine config type based on what's available and script name
+    if 'server' in ' '.join(sys.argv).lower() or 'dms-server' in ' '.join(sys.argv).lower():
+        if server_exists:
+            DMSConfig.load_config(config_type='server')
+            logger.debug("Auto-loaded server config")
+    elif 'client' in ' '.join(sys.argv).lower() or 'dms-client' in ' '.join(sys.argv).lower():
+        if client_exists:
+            DMSConfig.load_config(config_type='client')
+            logger.debug("Auto-loaded client config")
     else:
-        # Try client first (since DMSClient is more commonly imported)
-        DMSConfig.load_config(config_type='client')
+        # Don't auto-load - let the user specify explicitly
+        # This prevents loading the wrong config
+        logger.debug("Config not auto-loaded - use DMSConfig.load_config() explicitly")
+        
 except Exception as e:
     logger.warning(f"Failed to auto-load config: {e}")
     # Will load on first use

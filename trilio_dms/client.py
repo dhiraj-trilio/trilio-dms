@@ -148,7 +148,7 @@ class DMSClient:
         try:
             validate_request_structure(request)
 
-            job_id = int(request['job']['jobid'])
+            job_id = int(request['jobid'])
             backup_target_id = request['backup_target']['id']
             host = request['host']
 
@@ -272,7 +272,7 @@ class DMSClient:
         try:
             validate_request_structure(request)
 
-            job_id = int(request['job']['jobid'])
+            job_id = int(request['jobid'])
             backup_target_id = request['backup_target']['id']
             host = request['host']
 

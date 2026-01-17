@@ -24,20 +24,20 @@ def validate_request_structure(request: Dict[str, Any]) -> bool:
     Raises:
         ValueError if invalid
     """
-    required_fields = ['context', 'keystone_token', 'job', 'host', 'action', 'backup_target']
+    required_fields = ['context', 'keystone_token', 'jobid', 'host', 'action', 'backup_target']
     
     for field in required_fields:
         if field not in request:
             raise ValueError(f"Missing required field: {field}")
     
     # Validate job structure
-    job_fields = ['jobid', 'status', 'action']
-    for field in job_fields:
-        if field not in request['job']:
-            raise ValueError(f"Missing required job field: {field}")
+    #job_fields = ['jobid', 'status', 'action']
+    #for field in job_fields:
+    #    if field not in request['job']:
+    #        raise ValueError(f"Missing required job field: {field}")
     
     # Validate backup_target structure
-    target_fields = ['id', 'type', 'status']
+    target_fields = ['id', 'type', 'status', 'filesystem_export', 'filesystem_export_mount_path', 'secret_ref', 'nfs_mount_opts']
     for field in target_fields:
         if field not in request['backup_target']:
             raise ValueError(f"Missing required backup_target field: {field}")
@@ -49,12 +49,18 @@ def validate_request_structure(request: Dict[str, Any]) -> bool:
     # Validate backup target type
     if request['backup_target']['type'] not in ['s3', 'nfs']:
         raise ValueError(f"Invalid backup target type: {request['backup_target']['type']}")
-    
+
+    # Validate jobid is integer
+    try:
+        int(request['jobid'])
+    except (ValueError, TypeError):
+        raise RequestValidationException("jobid must be an integer")
+
     return True
 
 
 def create_response(status: str, error_msg: Optional[str] = None, 
-                   success_msg: Optional[str] = None) -> Dict[str, Any]:
+                   success_msg: Optional[str] = None, **kwargs) -> Dict[str, Any]:
     """
     Create standardized response
     

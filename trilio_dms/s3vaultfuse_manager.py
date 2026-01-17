@@ -322,10 +322,12 @@ class S3VaultFuseManager:
                 os.makedirs(mount_path, exist_ok=True)
                 
                 # Build command
-                cmd = [
-                    self.S3VAULTFUSE_BIN,
-                    mount_path
-                ]
+                #cmd = [
+                #    self.S3VAULTFUSE_BIN,
+                #    mount_path
+                #]
+                import pdb; pdb.set_trace()
+                cmd = [self.S3VAULTFUSE_BIN]
                 
                 logger.info(f"Spawning s3vaultfuse for target {target_id}: {' '.join(cmd)}")
                 logger.debug(f"Mount path: {mount_path}")
